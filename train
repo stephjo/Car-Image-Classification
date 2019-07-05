@@ -1,0 +1,404 @@
+import argparse
+
+import torch.backends.cudnn as cudnn
+import torch.nn as nn
+import torch.optim as optim
+import torch.utils.data as data
+from torch.autograd import Variable
+import torchvision.utils
+import ImgDataLoader
+import ImageFolder
+import augmentations
+import Model
+
+from data import *
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import torch
+import utils.helper
+from utils.helper import AverageMeter
+from tensorboardX import SummaryWriter
+import pandas as pd
+from torchvision import models
+
+
+
+
+
+def str2bool(v):
+    return v.lower() in ("yes", "true", "t", "1")
+
+
+
+
+parser = argparse.ArgumentParser(
+    description='Training Car Model Classifier with PyTorch')
+
+
+parser.add_argument('--basenet', default='weights/Cars.pth',
+                    help='Pretrained base model')
+parser.add_argument('--dataset_root', default='data',
+                    help='Dataset root directory path')
+parser.add_argument('--image_path', default='/cars_train/',
+                    help='Train dataset path')
+parser.add_argument('--train_annos_path', default='/devkit/cars_train_annos.mat',
+                    help='Train annotations path')
+parser.add_argument('--class_path', default='/devkit/cars_meta.mat',
+                    help='Class path')
+parser.add_argument('--batch_size', default=16, type=int,
+                    help='Batch size for training')
+parser.add_argument('--resume', default=True, type=str,
+                    help='Checkpoint state_dict file to resume training from')
+parser.add_argument('--start_iter', default=0, type=int,
+                    help='Resume training at this iter')
+parser.add_argument('--num_workers', default=0, type=int,
+                    help='Number of workers used in dataloading')
+parser.add_argument('--cuda', default=False, type=str2bool,
+                    help='Use CUDA to train model')
+parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float,
+                    help='initial learning rate')
+parser.add_argument('--momentum', default=0.9, type=float,
+                    help='Momentum value for optim')
+parser.add_argument('--weight_decay', default=5e-4, type=float,
+                    help='Weight decay for SGD')
+parser.add_argument('--gamma', default=0.1, type=float,
+                    help='Gamma update for SGD')
+parser.add_argument('--save_eval', default=True, type=str2bool,
+                    help='whether to run and save the test result')
+parser.add_argument('--save_folder', default='weights/',
+                    help='Directory for saving checkpoint models')
+parser.add_argument('--log_dir', default='logs/',
+                    help='Directory for saving tensorboard models')
+parser.add_argument('--end_iter', default=50, type=int,
+                    help='End training at this iter')
+parser.add_argument('--tensorboard', default=False, type=str2bool,
+                    help='Use tensorboard to display output')
+
+args = parser.parse_args()
+
+if torch.cuda.is_available():
+    if args.cuda:
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    if not args.cuda:
+        print("WARNING: It looks like you have a CUDA device, but aren't " +
+              "using CUDA.\nRun with --cuda for optimal training speed.")
+        torch.set_default_tensor_type('torch.FloatTensor')
+else:
+    torch.set_default_tensor_type('torch.FloatTensor')
+
+
+writer = SummaryWriter(os.path.join(args.log_dir, 'eval'))
+
+
+def train():
+
+    train_data_specification = ImgDataLoader.Image_AnnotationLoader(args.dataset_root,img_path=args.image_path,annos_path=args.train_annos_path,class_path=args.class_path,phase='train')
+    test_data_specification = ImgDataLoader.Image_AnnotationLoader(args.dataset_root,img_path=args.image_path,annos_path=args.train_annos_path,class_path=args.class_path,phase='val')
+
+
+    train_dataset = ImageFolder.ImageFolder(args.dataset_root,args.image_path,transform=augmentations.Augmentation(224), data_loader=train_data_specification)
+    test_dataset = ImageFolder.ImageFolder(args.dataset_root,args.image_path,transform=augmentations.Testing(224),data_loader=test_data_specification)
+
+    class_num = len(train_data_specification.class_names)
+
+
+    # Resnet Model
+    res_net= Model.build_resnet(phase='train',num_classes=196,size=224)
+    net=res_net
+
+    if args.cuda:
+        net = torch.nn.DataParallel(res_net)
+        cudnn.benchmark = True
+
+    if args.resume:
+        print('Resuming training, loading {}...'.format(args.basenet))
+        # res_net.load_weights(args.basenet)
+        Model.load_weights(res_net,args.basenet)
+    else:
+        print('Loading Resnet...')
+        # res_net.vgg.load_state_dict(vgg_weights)
+
+
+    if args.cuda:
+        net = net.cuda()
+
+    if not args.resume:
+        print('Initializing weights...')
+        # initialize newly added layers' weights with xavier method
+        res_net.apply(weights_init)
+
+#
+    optimizer = optim.Adam(net.parameters(), args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10,
+                                                           verbose=False, threshold=0.0001, threshold_mode='rel',
+                                                           cooldown=0, min_lr=0,
+                                                           eps=1e-08)
+    criterion = nn.CrossEntropyLoss()
+
+    net.train()
+
+
+    print('Loading the dataset...')
+
+    print('Training Resnet on:cars_train')
+    print('Using the specified args:')
+    print(args)
+
+    train_data_loader = data.DataLoader(train_dataset, args.batch_size,
+                                        num_workers=args.num_workers,
+                                        shuffle=True, collate_fn=detection_collate,
+                                        pin_memory=True)
+    test_data_loader = data.DataLoader(test_dataset, args.batch_size,
+                                       num_workers=args.num_workers,
+                                       shuffle=True, collate_fn=detection_collate,
+                                       pin_memory=True)
+
+    train_all_epochs(train_data_loader, test_data_loader, optimizer, net, res_net, criterion, args.start_iter,
+                     args.end_iter,
+                     args.cuda, scheduler=scheduler, gamma=args.gamma,
+                     save_folder=args.save_folder, save_eval=args.save_eval,tensrboard=args.tensorboard)
+#
+#
+def train_all_epochs(data_loader, test_data_loader, optimizer, net, res_net, criterion, start_iter, end_iter, is_cuda,
+                      scheduler, gamma=0.1, save_folder='weights/',
+                     save_eval=False,tensrboard=False):
+    Summary=[]
+    learning_rate=[]
+
+    for iteration in range(start_iter, end_iter):
+
+        # load train data
+        loss,(top1_acc,top5_acc),val_loss = train_single_epoch(
+            data_loader,
+            test_data_loader,
+            optimizer, net,
+            criterion, is_cuda,
+            save_eval)
+
+
+        if tensrboard :
+            writer.add_scalar('data/Train_loss', loss, iteration)
+            writer.add_scalar('data/Top1 Accuracy', top1_acc, iteration)
+            writer.add_scalar('data/Top5 Accuracy', top5_acc, iteration)
+            writer.add_scalar('data/Validation_loss', val_loss, iteration)
+
+        Summary.append([loss, val_loss, top1_acc, top5_acc])
+
+        scheduler.step(loss)
+        print('iteration: {},train_loss={},val_loss={},top1_acc={},top5_acc={}'.format(iteration, loss,val_loss,top1_acc,top5_acc))
+
+        for i, param_group in enumerate(optimizer.param_groups):
+            old_lr = float(param_group['lr'])
+            writer.add_scalar('hyper/learningrate/group{}'.format(i), old_lr, iteration)
+            if old_lr <= 1e-8:
+                break
+    print('Saving state, iter:', iteration)
+    torch.save(res_net.state_dict(),
+               os.path.join(save_folder,'Cars.pth'))
+
+    if not tensrboard:
+        Summary = pd.DataFrame(
+            Summary,
+            columns=[
+                'train_loss', 'eval_loss', 'eval_top1_acc',
+                'eval_top5_acc'
+            ])
+
+
+        plt.figure(figsize=(8, 6))
+        for c in ['train_loss', 'eval_loss']:
+            plt.plot(
+                Summary[c], label=c)
+        plt.legend()
+        plt.xlabel('Epoch')
+        plt.ylabel('Cross Entropy Loss')
+        plt.title('Training and Validation Losses')
+        plt.show()
+
+        plt.figure(figsize=(8, 6))
+        for c in ['eval_top1_acc', 'eval_top5_acc']:
+            plt.plot(
+                Summary[c], label=c)
+        plt.legend()
+        plt.xlabel('Epoch')
+        plt.ylabel('Average Validation Accuracies')
+        plt.title('Top1 and Top5 Validation Accuracy')
+        plt.show()
+
+
+
+
+
+def train_single_epoch(data_loader, test_data_loader, optimizer, net, criterion, is_cuda, save_eval):
+
+    batch_iterator = iter(data_loader)
+    meter = AverageMeter()
+    # count = 0
+    # maxcount = 500
+
+    while True:
+        try:
+            images, targets = next(batch_iterator)
+            # view_image = torchvision.utils.make_grid(images,5)
+            # augmentations.show_image_batch(view_image)
+        except StopIteration:
+            break
+
+        if is_cuda:
+            images = Variable(images.cuda())
+            targets = Variable(torch.LongTensor(targets).cuda())
+        else:
+            images = Variable(images)
+            targets = Variable(torch.LongTensor(targets))
+        # try:
+            # forward
+        out = net(images)
+        # out = net.forward(images)
+        # backprop
+        optimizer.zero_grad()
+        loss = criterion(out, targets)
+        if loss != float('inf'):
+            loss.backward()
+            optimizer.step()
+            meter.add(loss.item())
+
+        # count += images.size(0)
+        # if count >= maxcount:
+        #     break
+
+        # del images, targets, batch_iterator
+        # torch.cuda.empty_cache()
+
+    (top1_acc,top5_acc,val_loss) = (None, None,None)
+    # if save_eval:
+    if is_cuda:
+        net.eval()
+        # net.module.phase = 'test'
+    else:
+        net.eval()
+        # net.phase = 'test'
+    (top1_acc,top5_acc,val_loss) = evaluator(net, test_data_loader, criterion,is_cuda)
+
+    if is_cuda:
+        net.module.phase = 'train'
+    else:
+        net.phase = 'train'
+
+    return meter.get_average(), (top1_acc,top5_acc),val_loss
+
+
+
+def evaluator(net, data_loader, criterion,is_cuda=False):
+    """
+
+    :param net: Network
+    :param data_loader: Data Loader
+    :return: top1,top5 acc
+    """
+    batch_iterator = iter(data_loader)
+    meter = AverageMeter()
+    # count = 0
+    # maxcount = 100
+    i=0
+    while True:
+        try:
+            images, targets = next(batch_iterator)
+        except StopIteration:
+            break
+        if is_cuda:
+            images = Variable(images.cuda())
+            targets = Variable(torch.LongTensor(targets).cuda())
+        else:
+            images = Variable(images)
+            targets = Variable(torch.LongTensor(targets))
+
+        # out = net(images).cpu()
+        out = net.forward(images).cpu()
+        val_loss = criterion(out, targets)
+        if val_loss != float('inf'):
+            val_loss.backward()
+            meter.add(val_loss.item())
+        # count += images.size(0)
+        # if count >= maxcount:
+        if i >= 3:
+            break
+
+   #Checking the accuracy of image predictions from validation dataset
+    top1_acc=accuracy(out.data, targets)
+    top5_acc=accuracy(out.data, targets,topk=(5,))
+    '''
+    real_class = data_loader.dataset.classes[targets[0].item()+1]
+
+    # Find the topk predictions for first image in the batch
+    pred_id = torch.exp(out[0].data)
+
+    topk, topclass = pred_id.topk(5, 0, True, True)
+
+    # Extract the actual classes and probabilities
+    top_classes = [
+        data_loader.dataset.classes[class_+1] for class_ in topclass.cpu().numpy()
+    ]
+    top_p = topk.cpu().numpy()[0]
+
+
+    # _, pred_idx = torch.argmax(out[0].data)
+    # pred_class = data_loader.dataset.classes[pred_idx]
+    pred_image = Show_Image(images[0],top_classes[0],real_class)
+    print(str(
+        'top_p: {},top_classes: {},real_class: {},top1_acc: {},top5_acc: {}'.format(top_p,top_classes,real_class,targets[0].item()+1,top1_acc,top5_acc)))
+
+    # return top1_acc, top5_acc, pred_image,meter.get_average(),top_p,top_classes,real_class
+    '''
+    return top1_acc, top5_acc,meter.get_average()
+
+def accuracy(output, target,topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        res = []
+        for k in topk:
+            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+
+def xavier(param):
+    nn.init.xavier_uniform_(param)
+
+
+def weights_init(m):
+    if isinstance(m,nn.Linear):
+        xavier(m.weight.data)
+        m.bias.data.zero_()
+
+
+def Show_Image(img,pred_class=None,real_class=None):
+    '''
+    Show class names and the output image
+    :param img:image
+    :param pred_class:predicted class
+    :param real_class:actual_class
+    :return:
+    '''
+    npimg = img.data.to('cpu')
+    npimg = npimg.float().numpy()
+    npimg = npimg - npimg.min() / (npimg.max() - npimg.min() + np.finfo(float).eps)
+    plt.figure()
+    plt.imshow(np.transpose(npimg, (1, 2, 0)))
+    plt.pause(0.0001)
+    title = str(
+        'Predicted: {}, Original: {}'.format(pred_class, real_class))
+    plt.title(title)
+
+    return npimg
+
+
+if __name__ == '__main__':
+    train()
